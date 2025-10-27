@@ -8,7 +8,7 @@ from functools import cached_property
 from io import BytesIO
 from os.path import basename
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast, overload
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast, overload, AsyncIterator
 
 from httpx import AsyncClient
 
@@ -122,7 +122,6 @@ class Knowledge:
                     exclude=exclude,
                     upsert=upsert,
                     skip_if_exists=skip_if_exists,
-                    reader=reader,
                 )
             for url in urls:
                 await self.add_content_async(
@@ -134,7 +133,6 @@ class Knowledge:
                     exclude=exclude,
                     upsert=upsert,
                     skip_if_exists=skip_if_exists,
-                    reader=reader,
                 )
             for i, text_content in enumerate(text_contents):
                 content_name = f"{name}_{i}" if name else f"text_content_{i}"
@@ -148,7 +146,6 @@ class Knowledge:
                     exclude=exclude,
                     upsert=upsert,
                     skip_if_exists=skip_if_exists,
-                    reader=reader,
                 )
             if topics:
                 await self.add_content_async(
@@ -171,7 +168,6 @@ class Knowledge:
                     remote_content=remote_content,
                     upsert=upsert,
                     skip_if_exists=skip_if_exists,
-                    reader=reader,
                 )
 
         else:
@@ -285,6 +281,350 @@ class Knowledge:
         content.id = generate_id(content.content_hash)
 
         await self._load_content(content, upsert, skip_if_exists, include, exclude)
+
+    @overload
+    async def add_knowledge_stream_async(
+        self,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        text_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        reader: Optional[Reader] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        upsert: bool = True,
+        skip_if_exists: bool = True,
+        auth: Optional[ContentAuth] = None,
+        batch_size: int = 50,
+    ) -> None: ...
+
+    @overload
+    async def add_knowledge_stream_async(self, *args, **kwargs) -> None: ...
+
+    async def add_knowledge_stream_async(
+        self,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        text_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        reader: Optional[Reader] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        upsert: bool = True,
+        skip_if_exists: bool = True,
+        auth: Optional[ContentAuth] = None,
+        batch_size: int = 50,
+    ) -> None:
+        """
+        Stream-read content and insert in batches.
+        Prefers Reader.iter_read() when available; otherwise uses Reader.read() once.
+        """
+        from agno.vectordb import VectorDb
+        from urllib.parse import urlparse
+
+        self.vector_db = cast(VectorDb, self.vector_db)
+
+        if all(x is None for x in [path, url, text_content]):
+            log_warning("One of 'path', 'url', or 'text_content' is required.")
+            return
+
+        file_data = FileData(content=text_content, type="Text") if text_content else None
+        content = Content(
+            name=name,
+            description=description,
+            path=path,
+            url=url,
+            file_data=file_data,
+            metadata=metadata,
+            reader=reader,
+            auth=auth,
+        )
+        content.content_hash = self._build_content_hash(content)
+        content.id = generate_id(content.content_hash)
+
+        if content.metadata:
+            self.add_filters(content.metadata)
+
+        if self._should_skip(content.content_hash, skip_if_exists):
+            content.status = ContentStatus.COMPLETED
+            await self._aupdate_content(content)
+            return
+
+        await self._add_to_contents_db(content)
+
+        if self.vector_db and self.vector_db.__class__.__name__ == "LightRag":
+            if path:
+                await self._process_lightrag_content(content, KnowledgeContentOrigin.PATH)
+            elif url:
+                await self._process_lightrag_content(content, KnowledgeContentOrigin.URL)
+            else:
+                await self._process_lightrag_content(content, KnowledgeContentOrigin.CONTENT)
+            return
+
+        async def _vector_insert_batch(docs: List[Document]) -> None:
+            if not self.vector_db:
+                log_error("No vector database configured")
+                content.status = ContentStatus.FAILED
+                content.status_message = "No vector database configured"
+                await self._aupdate_content(content)
+                return
+            try:
+                if self.vector_db.upsert_available() and upsert:
+                    await self.vector_db.async_upsert(content.content_hash, docs, content.metadata)  # type: ignore[arg-type]
+                else:
+                    await self.vector_db.async_insert(
+                        content.content_hash, documents=docs, filters=content.metadata  # type: ignore[arg-type]
+                    )
+            except Exception as e:
+                log_error(f"Error inserting/upserting streamed batch: {e}")
+                content.status = ContentStatus.FAILED
+                content.status_message = "Could not insert/upsert streamed batch"
+                await self._aupdate_content(content)
+                raise
+
+        def _reader_for_path(p: Path) -> Reader:
+            r = content.reader or ReaderFactory.get_reader_for_extension(p.suffix)
+            if r is None:
+                raise ValueError(f"No reader available for extension: {p.suffix}")
+            return r
+
+        async def _stream_with_reader(
+            r: Reader,
+            source: Union[Path, BytesIO, io.BytesIO, str],
+            name_hint: Optional[str],
+        ) -> None:
+            docs_buffer: List[Document] = []
+
+            async def _maybe_chunk(batch: List[Document]) -> List[Document]:
+                if r and not getattr(r, "chunk", False):
+                    return await r.chunk_documents_async(batch)
+                return batch
+
+            async def _flush() -> None:
+                nonlocal docs_buffer
+                if not docs_buffer:
+                    return
+                for d in docs_buffer:
+                    d.content_id = content.id
+                await _vector_insert_batch(docs_buffer)
+                docs_buffer = []
+
+            try:
+                if hasattr(r, "iter_read"):
+                    sig = inspect.signature(getattr(r, "iter_read"))
+                    if "password" in sig.parameters and auth and auth.password:
+                        docs_iter = r.iter_read(source, name=name_hint, password=auth.password)  # type: ignore
+                    else:
+                        docs_iter = r.iter_read(source, name=name_hint)  # type: ignore
+
+                    async for item in docs_iter:
+                        if item is None:
+                            continue
+                        batch = item if isinstance(item, list) else [item]
+                        batch = await _maybe_chunk(batch)
+                        for d in batch:
+                            docs_buffer.append(d)
+                            if len(docs_buffer) >= batch_size:
+                                await _flush()
+                    await _flush()
+                else:
+                    sig = inspect.signature(r.read)
+                    if "password" in sig.parameters and auth and auth.password:
+                        read_docs = r.read(source, name=name_hint, password=auth.password)  # type: ignore
+                    else:
+                        read_docs = r.read(source, name=name_hint)  # type: ignore
+
+                    read_docs = await _maybe_chunk(read_docs)
+                    for d in read_docs:
+                        d.content_id = content.id
+                    await _vector_insert_batch(read_docs)
+            except Exception as e:
+                log_error(f"Stream read failed: {e}")
+                content.status = ContentStatus.FAILED
+                content.status_message = f"Stream failed: {str(e)}"
+                await self._aupdate_content(content)
+                raise
+
+        if path:
+            p = Path(path)
+            content.file_type = p.suffix
+            if p.is_file():
+                if not self._should_include_file(str(p), include, exclude):
+                    log_debug(f"Skipping file {p} due to include/exclude filters")
+                    content.status = ContentStatus.COMPLETED
+                    await self._aupdate_content(content)
+                    return
+                if not content.size:
+                    try:
+                        content.size = p.stat().st_size
+                    except Exception:
+                        content.size = 0
+                r = _reader_for_path(p)
+                await _stream_with_reader(r, p, name or p.name)
+
+            elif p.is_dir():
+                for child_path in p.iterdir():
+                    if not self._should_include_file(str(child_path), include, exclude):
+                        log_debug(f"Skipping file {child_path} due to include/exclude filters")
+                        continue
+
+                    child = Content(
+                        name=name,
+                        path=str(child_path),
+                        metadata=metadata,
+                        description=description,
+                        reader=reader,
+                    )
+                    child.content_hash = self._build_content_hash(child)
+                    child.id = generate_id(child.content_hash)
+                    await self._add_to_contents_db(child)
+
+                    if self._should_skip(child.content_hash, skip_if_exists):
+                        child.status = ContentStatus.COMPLETED
+                        await self._aupdate_content(child)
+                        continue
+
+                    fp = Path(child_path)
+                    if not child.file_type:
+                        child.file_type = fp.suffix
+                    if not child.size:
+                        try:
+                            child.size = fp.stat().st_size
+                        except Exception:
+                            child.size = 0
+
+                    try:
+                        r = _reader_for_path(fp)
+                        await _stream_with_reader(r, fp, name or fp.name)
+                        child.status = ContentStatus.COMPLETED
+                        await self._aupdate_content(child)
+                    except Exception as e:
+                        log_error(f"Error streaming {child_path}: {e}")
+                        child.status = ContentStatus.FAILED
+                        child.status_message = str(e)
+                        await self._aupdate_content(child)
+            else:
+                log_warning(f"Invalid path: {p}")
+
+        elif url:
+            content.file_type = "url"
+            parsed = urlparse(url)
+            if not all([parsed.scheme, parsed.netloc]):
+                content.status = ContentStatus.FAILED
+                content.status_message = f"Invalid URL format: {url}"
+                await self._aupdate_content(content)
+                return
+
+            ext = Path(parsed.path).suffix.lower()
+            r = reader
+            if r is None:
+                if ext == ".csv":
+                    r = self.csv_reader
+                elif ext == ".pdf":
+                    r = self.pdf_reader
+                elif ext == ".docx":
+                    r = self.docx_reader
+                elif ext == ".pptx":
+                    r = self.pptx_reader
+                elif ext == ".json":
+                    r = self.json_reader
+                elif ext == ".markdown":
+                    r = self.markdown_reader
+                else:
+                    r = self.text_reader
+            r = cast(Reader, r)
+
+            source: Union[str, BytesIO] = url
+            if ext:
+                async with AsyncClient() as client:
+                    response = await async_fetch_with_retry(url, client=client)
+                source = BytesIO(response.content)
+
+            await _stream_with_reader(r, source, name or url)
+
+        else:
+            if content.file_data:
+                source = io.BytesIO(
+                    content.file_data.content if isinstance(content.file_data.content, bytes)
+                    else str(content.file_data.content).encode("utf-8", errors="replace")
+                )
+                r = reader or self.text_reader
+                if r is None:
+                    content.status = ContentStatus.FAILED
+                    content.status_message = "Text reader not available"
+                    await self._aupdate_content(content)
+                    return
+                await _stream_with_reader(cast(Reader, r), source, name or "content")
+
+        content.status = ContentStatus.COMPLETED
+        await self._aupdate_content(content)
+
+
+    @overload
+    def add_knowledge_stream_sync(
+        self,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        text_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        reader: Optional[Reader] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        upsert: bool = True,
+        skip_if_exists: bool = True,
+        auth: Optional[ContentAuth] = None,
+        batch_size: int = 50,
+    ) -> None: ...
+
+    @overload
+    def add_knowledge_stream_sync(self, *args, **kwargs) -> None: ...
+
+    def add_knowledge_stream_sync(
+        self,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        text_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        reader: Optional[Reader] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        upsert: bool = True,
+        skip_if_exists: bool = True,
+        auth: Optional[ContentAuth] = None,
+        batch_size: int = 50,
+    ) -> None:
+        """
+        Synchronously stream-read content and insert in batches.
+        """
+        asyncio.run(
+            self.add_knowledge_stream_async(
+                name=name,
+                description=description,
+                path=path,
+                url=url,
+                text_content=text_content,
+                metadata=metadata,
+                reader=reader,
+                include=include,
+                exclude=exclude,
+                upsert=upsert,
+                skip_if_exists=skip_if_exists,
+                auth=auth,
+                batch_size=batch_size,
+            )
+        )
 
     @overload
     def add_content(
@@ -547,8 +887,6 @@ class Knowledge:
                 reader = self.pdf_reader
             elif file_extension == ".docx":
                 reader = self.docx_reader
-            elif file_extension == ".pptx":
-                reader = self.pptx_reader
             elif file_extension == ".json":
                 reader = self.json_reader
             elif file_extension == ".markdown":
@@ -837,8 +1175,6 @@ class Knowledge:
                     reader = self.csv_reader
                 elif s3_object.uri.endswith(".docx"):
                     reader = self.docx_reader
-                elif s3_object.uri.endswith(".pptx"):
-                    reader = self.pptx_reader
                 elif s3_object.uri.endswith(".json"):
                     reader = self.json_reader
                 elif s3_object.uri.endswith(".markdown"):
@@ -921,8 +1257,6 @@ class Knowledge:
                     reader = self.csv_reader
                 elif gcs_object.name.endswith(".docx"):
                     reader = self.docx_reader
-                elif gcs_object.name.endswith(".pptx"):
-                    reader = self.pptx_reader
                 elif gcs_object.name.endswith(".json"):
                     reader = self.json_reader
                 elif gcs_object.name.endswith(".markdown"):
@@ -1898,11 +2232,6 @@ class Knowledge:
     def docx_reader(self) -> Optional[Reader]:
         """Docx reader - lazy loaded via factory."""
         return self._get_reader("docx")
-
-    @property
-    def pptx_reader(self) -> Optional[Reader]:
-        """PPTX reader - lazy loaded via factory."""
-        return self._get_reader("pptx")
 
     @property
     def json_reader(self) -> Optional[Reader]:
